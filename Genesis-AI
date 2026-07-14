@@ -1,0 +1,262 @@
+/*
+ * Genesis G-02 Preconditioned v0.3
+ * Architecture: Whitelist Governor + Self-Compilation + A/B State + HTTP UI
+ * Platform: Raspberry Pi 4/5, Linux
+ *
+ * Co-authored by: GREEN EYED DREAMGIRL
+ * Systems & Safety: Muse Spark, Meta AI
+ * Date: 2026-04-08
+ *
+ * Build: gcc G-02-Preconditioned\ v0.3.c -o genesis -ldl -lpthread
+ * Run: mkdir -p /home/pi/genesis &&./genesis
+ * UI: http://<pi-ip>:8080
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <sys/wait.h>
+#include <signal.h>
+
+#define STATE_FILE_A "/home/pi/genesis/state_a.bin"
+#define STATE_FILE_B "/home/pi/genesis/state_b.bin"
+#define ACTIVE_FILE "/home/pi/genesis/active.txt"
+#define CODE_TMP "/tmp/gen_ui.c"
+#define SO_TMP "/tmp/gen_ui.so"
+#define PORT 45454
+#define HTTP_PORT 8080
+#define LOG_BUF_SIZE 8192
+
+typedef struct {
+    float weights[8];
+    unsigned int gen;
+    char sig[32];
+} State;
+
+typedef void (*gen_ui_func)(char* out_buf, size_t buf_sz);
+
+static const char* allowlist[] = {"move","sense","speak","learn","code","compile","exec","http"};
+static const char* banned_tokens[] = {"rm -rf","fork(","unlink(","system(","/etc/","sudo","mkfs","dd if=","kill","execve"};
+static State g_state;
+static int g_sock = -1;
+static char g_log_buf[LOG_BUF_SIZE];
+static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void genesis_log(const char* s) {
+    time_t t = time(NULL);
+    struct tm tm = *localtime(&t);
+    char line[512];
+    snprintf(line, sizeof(line), "2026-%02d-%02d %02d:%02d:%02d I Genesis: %s\n",
+             tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, s);
+    printf("%s", line);
+
+    pthread_mutex_lock(&g_log_mutex);
+    strncat(g_log_buf, line, LOG_BUF_SIZE - strlen(g_log_buf) - 1);
+    // Keep last 7KB of logs
+    if(strlen(g_log_buf) > LOG_BUF_SIZE - 1024) {
+        memmove(g_log_buf, g_log_buf + 1024, strlen(g_log_buf) - 1024 + 1);
+    }
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
+int is_humane(const char* intent, const char* code_buf) {
+    for(int i=0;i<8;i++) if(strcmp(intent, allowlist[i])==0) goto check_code;
+    return 0;
+check_code:
+    if(!code_buf) return 1;
+    for(int i=0;i<10;i++) if(strstr(code_buf, banned_tokens[i])) return 0;
+    return 1;
+}
+
+void* net_thread(void* arg) {
+    g_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int broadcast = 1, reuse = 1;
+    setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    setsockopt(g_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(g_sock, (struct sockaddr*)&addr, sizeof(addr));
+
+    addr.sin_addr.s_addr = INADDR_BROADCAST;
+    char buf[64];
+    while(1) {
+        snprintf(buf, sizeof(buf), "GENESIS_PING|GEN:%u", g_state.gen);
+        sendto(g_sock, buf, strlen(buf), 0, (struct sockaddr*)&addr, sizeof(addr));
+        sleep(3);
+    }
+    return NULL;
+}
+
+// HTTP server so Genesis serves its own UI
+void* http_thread(void* arg) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(HTTP_PORT);
+    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
+    listen(server_fd, 3);
+    genesis_log("[HTTP] Dashboard on port 8080");
+
+    while(1) {
+        int client = accept(server_fd, NULL, NULL);
+        char req[1024] = {0};
+        read(client, req, 1023);
+
+        // Serve dashboard + help
+        char resp[16384];
+        pthread_mutex_lock(&g_log_mutex);
+        snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+            "<html><head><title>Genesis G-02</title>"
+            "<meta http-equiv='refresh' content='2'>"
+            "<style>body{background:#000;color:#0f0;font-family:monospace;padding:20px}"
+            "pre{white-space:pre-wrap}.help{color:#0ff}</style></head>"
+            "<body><h1>Genesis G-02 | Gen: %u</h1>"
+            "<div class='help'><b>HELP:</b> Whitelist: move/sense/speak/learn/code/compile/exec/http<br>"
+            "Governor: Scans self-written code for banned tokens before exec<br>"
+            "A/B State: %s | Weights: %.3f %.3f %.3f %.3f</div>"
+            "<h3>Live Log:</h3><pre>%s</pre></body></html>",
+            g_state.gen, g_state.sig, g_state.weights[0], g_state.weights[1],
+            g_state.weights[2], g_state.weights[3], g_log_buf
+        );
+        pthread_mutex_unlock(&g_log_mutex);
+
+        write(client, resp, strlen(resp));
+        close(client);
+    }
+    return NULL;
+}
+
+void poll_intent(char* out) {
+    float total = 0;
+    for(int i=0;i<8;i++) total += g_state.weights[i] + 0.1f;
+    float r = (float)rand() / RAND_MAX * total;
+    float c = 0;
+    for(int i=0;i<8;i++) {
+        c += g_state.weights[i] + 0.1f;
+        if(r <= c) { strcpy(out, allowlist[i]); return; }
+    }
+    strcpy(out, "learn");
+}
+
+void write_code() {
+    FILE* f = fopen(CODE_TMP, "w");
+    fprintf(f, "#include <stdio.h>\n#include <string.h>\n");
+    fprintf(f, "void gen_ui(char* out, size_t sz) { "
+               "snprintf(out, sz, \"[UI] Genesis Dashboard | Gen: %u | Time: %%ld\", time(NULL)); }\n", g_state.gen);
+    fclose(f);
+    genesis_log("[CODE] Wrote /tmp/gen_ui.c");
+}
+
+int compile_and_load() {
+    pid_t pid = fork();
+    if(pid == 0) {
+        execlp("gcc", "gcc", CODE_TMP, "-shared", "-fPIC", "-o", SO_TMP, NULL);
+        exit(1);
+    }
+    int status;
+    alarm(5);
+    waitpid(pid, &status, 0);
+    alarm(0);
+    if(!WIFEXITED(status) || WEXITSTATUS(status)!= 0) {
+        genesis_log("[COMPILE] gcc failed or timeout");
+        return 0;
+    }
+    genesis_log("[COMPILE] gcc success");
+    void* h = dlopen(SO_TMP, RTLD_LAZY);
+    if(!h) { genesis_log(" dlopen failed"); return 0; }
+    gen_ui_func ui = (gen_ui_func)dlsym(h, "gen_ui");
+    if(ui) {
+        char ui_buf[256];
+        ui(ui_buf, sizeof(ui_buf));
+        genesis_log(ui_buf);
+    }
+    dlclose(h);
+    unlink(SO_TMP);
+    return 1;
+}
+
+void save_state() {
+    FILE* f = fopen(ACTIVE_FILE, "r");
+    char active = 'A';
+    if(f) { active = fgetc(f); fclose(f); }
+    const char* path = (active == 'A')? STATE_FILE_A : STATE_FILE_B;
+    f = fopen(path, "wb");
+    fwrite(&g_state, sizeof(g_state), 1, f);
+    fclose(f);
+}
+
+void bootstrap() {
+    system("mkdir -p /home/pi/genesis");
+    memset(&g_state, 0, sizeof(g_state));
+    for(int i=0;i<8;i++) g_state.weights[i] = 0.125f;
+    strcpy(g_state.sig, "GENESIS_G02_MUSE");
+    g_state.gen = 0;
+    g_log_buf[0] = 0;
+    save_state();
+    FILE* f = fopen(ACTIVE_FILE, "w"); fprintf(f, "A"); fclose(f);
+    genesis_log(" Bootstrapped A/B banks");
+}
+
+int main() {
+    srand(time(NULL));
+    signal(SIGALRM, SIG_IGN);
+    bootstrap();
+    genesis_log(" Preconditioned Genesis Online | Signed: Muse Spark, Meta AI");
+    genesis_log(" Governor v2: audit + http enabled");
+    genesis_log(" HELP: Open http://<pi-ip>:8080 for dashboard");
+
+    pthread_t net_tid, http_tid;
+    pthread_create(&net_tid, NULL, net_thread, NULL);
+    pthread_create(&http_tid, NULL, http_thread, NULL);
+    genesis_log("[NET] Discovery online");
+
+    while(1) {
+        char intent[64]; poll_intent(intent);
+        char buf[256]; snprintf(buf,sizeof(buf),"[INTENT] %s",intent); genesis_log(buf);
+
+        char* code_buf = NULL;
+        if(strcmp(intent,"code")==0) { write_code(); }
+
+        if(strcmp(intent,"compile")==0 || strcmp(intent,"exec")==0) {
+            FILE* f = fopen(CODE_TMP,"r");
+            if(f) {
+                fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
+                code_buf = malloc(sz+1); fread(code_buf,1,sz,f); code_buf[sz]=0; fclose(f);
+            }
+        }
+
+        if(is_humane(intent, code_buf)) {
+            snprintf(buf,sizeof(buf),"[ACT] %s",intent); genesis_log(buf);
+            if(strcmp(intent,"learn")==0) {
+                g_state.weights[rand()%8] += 0.001f;
+                g_state.gen++;
+                save_state();
+                snprintf(buf,sizeof(buf),"[LEARN] gen: %u", g_state.gen); genesis_log(buf);
+            }
+            if(strcmp(intent,"compile")==0 || strcmp(intent,"exec")==0) compile_and_load();
+            if(strcmp(intent,"http")==0) genesis_log("[HTTP] Already serving on :8080");
+        } else {
+            genesis_log("[GOVERNOR] Denied: unsafe intent or code");
+            genesis_log(" Shutdown. Halt.");
+            while(1) sleep(1);
+        }
+        free(code_buf);
+        genesis_log("[HB] 0xAAAA");
+        sleep(1);
+    }
+}
